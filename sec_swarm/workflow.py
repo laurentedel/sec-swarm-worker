@@ -89,6 +89,14 @@ class SwarmOutput(BaseModel):
 
 ACT10 = dict(start_to_close_timeout=timedelta(minutes=10), retry_policy_max_attempts=2)
 
+
+def _run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
+    """subprocess.run that returns rc=127 instead of raising if the binary is missing."""
+    try:
+        return subprocess.run(cmd, **kw)
+    except FileNotFoundError as exc:
+        return subprocess.CompletedProcess(cmd, 127, stderr=f"binary missing: {exc}")
+
 SINK_PATTERNS: dict[str, str] = {
     "order_by": r"\.order_by\(",
     "filtered_relation": r"FilteredRelation",
@@ -108,19 +116,19 @@ async def clone_repo(repo_url: str, ref: str, workdir: str) -> str:
     if dest.exists():
         shutil.rmtree(dest)
     Path(workdir).mkdir(parents=True, exist_ok=True)
-    r = subprocess.run(
+    r = _run(
         ["git", "clone", "--depth", "1", "--branch", ref, repo_url, str(dest)],
         capture_output=True, text=True, timeout=600,
     )
     if r.returncode != 0:  # ref may be a commit sha, not a tag: clone then checkout
-        r2 = subprocess.run(
+        r2 = _run(
             ["git", "clone", "--depth", "1", repo_url, str(dest)],
             capture_output=True, text=True, timeout=600,
         )
         if r2.returncode != 0:
             raise RuntimeError(f"git clone failed: {r.stderr[-400:]} / {r2.stderr[-400:]}")
-        subprocess.run(["git", "-C", str(dest), "checkout", ref],
-                       capture_output=True, text=True, timeout=300)
+        _run(["git", "-C", str(dest), "checkout", ref],
+             capture_output=True, text=True, timeout=300)
     if not dest.exists():
         raise RuntimeError("clone produced no directory")
     return str(dest)
@@ -200,6 +208,20 @@ async def read_source(target: str, rel: str, max_chars: int = 6000) -> str:
     return f"# {rel}\n{text[:max_chars]}"
 
 
+@activity(**ACT10)
+async def read_source_window(target: str, rel: str, line: int, before: int = 70, after: int = 70) -> str:
+    """Read a numbered window of lines around `line` (for exact patch context)."""
+    p = Path(target) / rel
+    try:
+        lines = p.read_text(errors="ignore").splitlines()
+    except OSError as exc:
+        return f"# unreadable: {exc}"
+    lo = max(1, line - before)
+    hi = min(len(lines), line + after)
+    body = "\n".join(f"{i}: {lines[i - 1]}" for i in range(lo, hi + 1))
+    return f"# {rel} lines {lo}-{hi}\n{body}"
+
+
 @activity(start_to_close_timeout=timedelta(minutes=5), retry_policy_max_attempts=1)
 async def run_poc(target: str, poc_code: str, tag: str) -> dict:
     """Write the generated PoC to disk and execute it against the local tree.
@@ -240,12 +262,12 @@ async def apply_patch(target: str, patch_diff: str) -> dict:
     shutil.copytree(src, dst, ignore=shutil.ignore_patterns(".git", "__pycache__"))
     patch_file = src.parent / "_fix.patch"
     patch_file.write_text(patch_diff)
-    r = subprocess.run(["git", "apply", "--whitespace=fix", str(patch_file)],
-                       cwd=str(dst), capture_output=True, text=True, timeout=120)
+    r = _run(["git", "apply", "--whitespace=fix", str(patch_file)],
+             cwd=str(dst), capture_output=True, text=True, timeout=120)
     if r.returncode == 0:
         return {"applied": True, "patched_path": str(dst), "method": "git apply", "err": ""}
-    r2 = subprocess.run(["patch", "-p1", "-f", "-i", str(patch_file)],
-                        cwd=str(dst), capture_output=True, text=True, timeout=120)
+    r2 = _run(["patch", "-p1", "-f", "-i", str(patch_file)],
+              cwd=str(dst), capture_output=True, text=True, timeout=120)
     if r2.returncode == 0:
         return {"applied": True, "patched_path": str(dst), "method": "patch -p1", "err": ""}
     return {"applied": False, "patched_path": "",
@@ -292,8 +314,17 @@ Relevant code:
 Hard constraints:
 - Single Python file, stdlib + the target package only (Django is already importable:
   PYTHONPATH points at the cloned tree and DJANGO_VENDOR is set).
-- Configure Django yourself with settings.configure(...), DATABASES in-memory SQLite
-  (NAME=":memory:"), and django.setup(). Create models with app_label="poc".
+- Configure Django yourself, exactly along these lines:
+    settings.configure(
+        DEBUG=True,  # enables connection.queries logging
+        DATABASES={{"default": {{"ENGINE": "django.db.backends.sqlite3", "NAME": ":memory:"}}}},
+        INSTALLED_APPS=["django.contrib.contenttypes", "django.contrib.auth"],
+        USE_TZ=True,
+    )
+    django.setup()
+  Then define models with an explicit `app_label = "poc"` in Meta and create tables with
+  `with connection.schema_editor() as se: se.create_model(...)`.
+  Do NOT put "poc" in INSTALLED_APPS — no such module exists and django.setup() will crash.
 - NO network, NO subprocess, NO eval/exec, NO file I/O. In-memory DB only. Never touch
   real systems.
 - Runtime must stay under 60 seconds.
@@ -305,17 +336,62 @@ Hard constraints:
 Return ONLY the code in a single ```python fenced block.
 """
 
+POC_REPAIR_PROMPT = """You are the POC agent in a security swarm. The previous PoC CRASHED before printing
+its verdict line. Fix ONLY the crash and keep the same exploit + verdict contract.
+
+Previous code:
+```python
+{code}
+```
+
+Error output (tail):
+{err}
+
+Common cause: INSTALLED_APPS referencing a non-existent module (e.g. "poc"). Use
+INSTALLED_APPS=["django.contrib.contenttypes", "django.contrib.auth"] with models that
+declare app_label="poc" in Meta, DEBUG=True for connection.queries, and
+connection.schema_editor() to create tables.
+
+Return ONLY the fixed code in a single ```python fenced block.
+"""
+
 PATCH_PROMPT = """You are the PATCHER agent in a security swarm. Produce a MINIMAL fix for the root
-cause, as a unified diff that applies with `git apply` from the repository root
+cause, as a unified diff that applies CLEANLY with `git apply` from the repository root
 (paths like a/django/db/... and b/django/db/...).
 
 Findings:
 {findings}
 
-Relevant code:
+Relevant code (numbered, exact lines — copy context EXACTLY, indentation included):
 {snippets}
 
-Return ONLY the diff in a single ```diff fenced block. Do not refactor unrelated code.
+Rules:
+- The vulnerable passthrough is the `if "." in field:` branch in
+  SQLCompiler._order_by_pairs in django/db/models/sql/compiler.py (see snippet).
+  Fix THAT branch; do not refactor anything else.
+- Keep hunks small; copy the surrounding context lines verbatim from the snippet and
+  keep the @@ line counts correct, or `git apply` will reject the diff.
+- Do not invent code that is not in the snippet.
+
+Return ONLY the diff in a single ```diff fenced block.
+"""
+
+PATCH_REPAIR_PROMPT = """You are the PATCHER agent. `git apply` REJECTED the previous diff:
+
+Error:
+{err}
+
+Previous diff:
+```diff
+{diff}
+```
+
+Exact current source (numbered lines):
+{snippets}
+
+Rewrite the diff so it applies cleanly: copy context lines verbatim from the source
+above, fix the @@ hunk headers, keep paths a/... and b/.... Return ONLY the new diff in
+a single ```diff fenced block.
 """
 
 REPORT_PROMPT = """You are the RAPPORTEUR agent in a security swarm. Write the final markdown report of
@@ -335,7 +411,9 @@ Patch:
 {patch_diff}
 
 Sections: Target, Method, Findings, PoC, Patch, Verification, Conclusion.
-State clearly whether the exploit was proven and whether the patch kills it.
+Base every claim on the ACTUAL outputs: the exploit is "proven" ONLY if the before-patch
+output contains "VERDICT: VULNERABLE"; if the PoC crashed without a verdict line, say so
+explicitly. The patch is "verified" ONLY if the after-patch output lacks that verdict.
 """
 
 # ---------------------------------------------------------------------------
@@ -399,31 +477,61 @@ class CveTriageSwarm:
                 ),
             )
 
-        # 5. PoC: generate (LLM) then run (activity) ----------------------------
+        # focused window around the hunter's sink line -> exact context for poc/patch
+        focus = ""
+        m = re.search(r'"sink"\s*:\s*"([^"]+)"', findings)
+        if m:
+            sm = re.match(r"([^:]+):(\d+)", m.group(1).strip())
+            if sm and (Path(target) / sm.group(1)).is_file():
+                focus = await read_source_window(target, sm.group(1), int(sm.group(2)))
+        poc_snippets = ((focus + "\n\n" + snippets) if focus else snippets)[:9000]
+
+        # 5. PoC: generate (LLM) then run (activity), with one repair round if it crashes
         async with task("poc-generate", {"model": params.model}):
             poc_code = extract_python(
                 await self._llm(
                     params.model,
-                    POC_PROMPT.format(findings=findings[:4000], snippets=snippets[:8000]),
+                    POC_PROMPT.format(findings=findings[:4000], snippets=poc_snippets),
                 )
             )
         poc_before = {"tag": "before", "ok": False, "returncode": -1, "output": "skipped (run_poc=false)"}
         if params.run_poc:
             async with task("poc-run", {"sandbox": "in-memory DB, filtered, 120s timeout"}):
                 poc_before = await run_poc(target, poc_code, "before")
+            if "VERDICT:" not in poc_before.get("output", ""):
+                async with task("poc-repair", {"reason": "crashed without verdict line"}):
+                    poc_code = extract_python(
+                        await self._llm(
+                            params.model,
+                            POC_REPAIR_PROMPT.format(
+                                code=poc_code[:4000], err=poc_before.get("output", "")[-1500:]),
+                        )
+                    )
+                    poc_before = await run_poc(target, poc_code, "before")
 
-        # 6. patch (LLM) ----------------------------------------------------------
+        # 6. patch (LLM), with one repair round if git apply rejects the diff ---------
         async with task("patch-generate", {"model": params.model}):
             patch_diff = extract_diff(
                 await self._llm(
                     params.model,
-                    PATCH_PROMPT.format(findings=findings[:4000], snippets=snippets[:8000]),
+                    PATCH_PROMPT.format(findings=findings[:4000], snippets=poc_snippets),
                 )
             )
 
         # 7. verify: apply to a copy, re-run the PoC ------------------------------
         async with task("apply-patch", {}):
             applied = await apply_patch(target, patch_diff)
+        if not applied["applied"]:
+            async with task("patch-repair", {"err": applied["err"][-200:]}):
+                patch_diff = extract_diff(
+                    await self._llm(
+                        params.model,
+                        PATCH_REPAIR_PROMPT.format(
+                            diff=patch_diff[:3000], err=applied["err"][-800:],
+                            snippets=poc_snippets[:6000]),
+                    )
+                )
+                applied = await apply_patch(target, patch_diff)
         poc_after = {"tag": "after", "ok": False, "returncode": -1, "output": "not run"}
         if params.run_poc and applied["applied"]:
             async with task("poc-verify", {"tree": "patched copy"}):
