@@ -222,6 +222,22 @@ async def read_source_window(target: str, rel: str, line: int, before: int = 70,
     return f"# {rel} lines {lo}-{hi}\n{body}"
 
 
+@activity(**ACT10)
+async def find_line(target: str, needle: str) -> dict:
+    """Locate the first file:line containing `needle` (deterministic sink locator)."""
+    root = Path(target)
+    for p in sorted(root.rglob("*.py")):
+        if "__pycache__" in str(p):
+            continue
+        try:
+            for i, line in enumerate(p.read_text(errors="ignore").splitlines(), 1):
+                if needle in line:
+                    return {"file": str(p.relative_to(root)), "line": i, "text": line.strip()[:160]}
+        except OSError:
+            continue
+    return {"file": "", "line": 0, "text": ""}
+
+
 @activity(start_to_close_timeout=timedelta(minutes=5), retry_policy_max_attempts=1)
 async def run_poc(target: str, poc_code: str, tag: str) -> dict:
     """Write the generated PoC to disk and execute it against the local tree.
@@ -328,29 +344,55 @@ Hard constraints:
 - NO network, NO subprocess, NO eval/exec, NO file I/O. In-memory DB only. Never touch
   real systems.
 - Runtime must stay under 60 seconds.
-- Prove impact behaviourally (e.g. boolean-blind oracle flipping row order, or injected
-  SQL visible in the executed statement), not by reading the version string.
+
+The exploit pattern to reproduce (this is the CVE): a DOTTED string alias is used BOTH as
+a dict-expansion key for FilteredRelation AND as the order_by() argument. In the
+vulnerable compiler, everything after the FIRST "." of such an alias is emitted RAW into
+ORDER BY. Skeleton (see also tests/annotations/tests.py for the crafted_alias pattern):
+
+    crafted = "<model_table>.id*0+" + payload   # one SQL expression, NO commas/quotes;
+                                                # use char(N) instead of string literals
+    qs = (Model.objects
+          .extra(tables=["vault"])                          # bring an out-of-scope table into scope
+          .annotate(**{{crafted: FilteredRelation("author")}})  # dotted alias as dict key
+          .order_by(crafted))                               # same alias in order_by
+
+Define two models with a ForeignKey (e.g. Author -> Article, relation name "author"),
+create a "vault" table with a secret via connection.cursor(), then prove the injection
+BEHAVIOURALLY: run the query with two different boolean guesses (e.g. substr(vault.secret,1,1)=char(N))
+and check whether the ROW ORDER flips (boolean-blind oracle), and/or print the compiled
+ORDER BY from str(qs.query). Base the verdict on that behaviour, not on the version string.
+
 - End stdout with exactly one verdict line: "VERDICT: VULNERABLE" if the injection
-  demonstrably executed, otherwise "VERDICT: BLOCKED".
+  demonstrably executed (row order flipped or injected SQL present in the EXECUTED
+  statement via connection.queries), otherwise "VERDICT: BLOCKED".
 
 Return ONLY the code in a single ```python fenced block.
 """
 
-POC_REPAIR_PROMPT = """You are the POC agent in a security swarm. The previous PoC CRASHED before printing
-its verdict line. Fix ONLY the crash and keep the same exploit + verdict contract.
+POC_REPAIR_PROMPT = """You are the POC agent in a security swarm. The previous PoC ran but did NOT
+print the required verdict (it crashed or the exploit never fired). Fix it and keep the
+same verdict contract.
 
 Previous code:
 ```python
 {code}
 ```
 
-Error output (tail):
+Output it produced (tail):
 {err}
 
-Common cause: INSTALLED_APPS referencing a non-existent module (e.g. "poc"). Use
-INSTALLED_APPS=["django.contrib.contenttypes", "django.contrib.auth"] with models that
-declare app_label="poc" in Meta, DEBUG=True for connection.queries, and
-connection.schema_editor() to create tables.
+Checklist:
+- INSTALLED_APPS must be ["django.contrib.contenttypes", "django.contrib.auth"] (never "poc").
+- The crafted alias MUST be a DOTTED string used both as annotate(**{{alias: FilteredRelation(...)}})
+  key and as order_by(alias) argument — a plain non-dotted string will NOT reach the raw
+  ORDER BY passthrough.
+- The FilteredRelation relation_name must be a REAL relation of the model (e.g. the FK "author").
+- payload must be a single SQL expression without commas or quotes (use char(N)); prefix
+  with "<table>.id*0+" so it stays one expression.
+- Use .extra(tables=["vault"]) to bring the secret table into scope, create it with
+  connection.cursor(), and read the executed SQL from connection.queries (needs DEBUG=True).
+- Compare row order for two guesses to detect the boolean-blind oracle flip.
 
 Return ONLY the fixed code in a single ```python fenced block.
 """
@@ -366,9 +408,13 @@ Relevant code (numbered, exact lines — copy context EXACTLY, indentation inclu
 {snippets}
 
 Rules:
-- The vulnerable passthrough is the `if "." in field:` branch in
-  SQLCompiler._order_by_pairs in django/db/models/sql/compiler.py (see snippet).
+- The sink is the `if "." in field:` branch inside SQLCompiler._order_by_pairs in
+  django/db/models/sql/compiler.py — the numbered snippet below shows it verbatim.
   Fix THAT branch; do not refactor anything else.
+- Minimal upstream-style fix: only take the raw passthrough when the dotted field is
+  explicitly whitelisted, i.e. the condition should also require the field to be present
+  in self.query.extra_order_by (check how extra_order_by is populated); otherwise fall
+  through to normal field resolution.
 - Keep hunks small; copy the surrounding context lines verbatim from the snippet and
   keep the @@ line counts correct, or `git apply` will reject the diff.
 - Do not invent code that is not in the snippet.
@@ -477,13 +523,11 @@ class CveTriageSwarm:
                 ),
             )
 
-        # focused window around the hunter's sink line -> exact context for poc/patch
+        # deterministic sink locator -> exact numbered context for the poc/patch prompts
+        loc = await find_line(target, 'if "." in field:')
         focus = ""
-        m = re.search(r'"sink"\s*:\s*"([^"]+)"', findings)
-        if m:
-            sm = re.match(r"([^:]+):(\d+)", m.group(1).strip())
-            if sm and (Path(target) / sm.group(1)).is_file():
-                focus = await read_source_window(target, sm.group(1), int(sm.group(2)))
+        if loc["file"]:
+            focus = await read_source_window(target, loc["file"], loc["line"])
         poc_snippets = ((focus + "\n\n" + snippets) if focus else snippets)[:9000]
 
         # 5. PoC: generate (LLM) then run (activity), with one repair round if it crashes
@@ -498,8 +542,10 @@ class CveTriageSwarm:
         if params.run_poc:
             async with task("poc-run", {"sandbox": "in-memory DB, filtered, 120s timeout"}):
                 poc_before = await run_poc(target, poc_code, "before")
-            if "VERDICT:" not in poc_before.get("output", ""):
-                async with task("poc-repair", {"reason": "crashed without verdict line"}):
+            for attempt in range(1, 3):  # up to 2 repair rounds if no verdict line
+                if "VERDICT:" in poc_before.get("output", ""):
+                    break
+                async with task("poc-repair", {"attempt": attempt, "reason": "no verdict line"}):
                     poc_code = extract_python(
                         await self._llm(
                             params.model,
@@ -518,11 +564,13 @@ class CveTriageSwarm:
                 )
             )
 
-        # 7. verify: apply to a copy, re-run the PoC ------------------------------
+        # 7. verify: apply to a copy (up to 2 repair rounds), re-run the PoC --------
         async with task("apply-patch", {}):
             applied = await apply_patch(target, patch_diff)
-        if not applied["applied"]:
-            async with task("patch-repair", {"err": applied["err"][-200:]}):
+        for attempt in range(1, 3):
+            if applied["applied"]:
+                break
+            async with task("patch-repair", {"attempt": attempt, "err": applied["err"][-150:]}):
                 patch_diff = extract_diff(
                     await self._llm(
                         params.model,
